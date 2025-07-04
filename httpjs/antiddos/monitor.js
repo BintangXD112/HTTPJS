@@ -1,17 +1,32 @@
-// Monitoring & Notification Middleware
-const url = require('url');
-const ipReqs = require('./rateLimiter').ipReqs || {};
+// Monitoring & Notification Middleware (Real-time Monitoring)
+const { whitelisted, loadWhitelist } = require('./whitelist');
+const { stats } = require('./stats');
 
-module.exports = function monitor(options = {}) {
-  return (req, res, next) => {
-    if (req.url === '/status') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        activeIPs: Object.keys(ipReqs).length,
-        time: new Date().toISOString()
-      }));
+function getActiveStats() {
+  return {
+    totalRequests: stats.totalRequests,
+    blocked: stats.blocked,
+    permanentBlocked: stats.permanentBlocked,
+    activeIPs: Array.from(stats.activeIPs),
+    lastReset: stats.lastReset,
+    time: new Date().toISOString()
+  };
+}
+
+async function monitorMiddleware(req, res, next) {
+  const ip = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : req.socket.remoteAddress;
+  await loadWhitelist();
+  if (req.url === '/admin/monitor') {
+    if (!whitelisted.has(ip)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Forbidden' }));
       return;
     }
-    next();
-  };
-}; 
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(getActiveStats()));
+    return;
+  }
+  next();
+}
+
+module.exports = { monitorMiddleware }; 

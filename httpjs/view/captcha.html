@@ -7,6 +7,11 @@
 <body>
   <h1>CAPTCHA Required</h1>
   <p>Please complete the CAPTCHA to continue.</p>
-  <!-- TODO: Integrasi CAPTCHA -->
+  <form method="POST" action="/captcha/verify">
+    <input type="hidden" name="session_id" value="<!--SESSION_ID-->">
+    <label for="captcha_answer">Masukkan kode berikut: <b><!--CAPTCHA_CODE--></b></label><br>
+    <input type="text" id="captcha_answer" name="captcha_answer" required autofocus>
+    <button type="submit">Submit</button>
+  </form>
 </body>
 </html> 

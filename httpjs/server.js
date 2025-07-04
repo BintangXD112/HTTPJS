@@ -33,7 +33,7 @@ const viewDir = path.join(__dirname, 'view');
 // DDoS detection: track requests per IP
 const requestCounts = {};
 const WINDOW_MS = 5000; // 5 seconds
-const MAX_REQ = 20;
+const MAX_REQ = 10;
 const blockedIPs = {};
 const BLOCK_TIME = 10000; // 10 detik
 
@@ -61,6 +61,7 @@ function logAccess({ method, url, status, ip, file, time }) {
     chalk.gray('|'),
     chalk.white('File:'), chalk.blue(file)
   );
+  logToFile({ level: status === 200 ? 'INFO' : status === 404 ? 'WARN' : 'ERROR', ip, event: 'ACCESS', detail: `${method} ${url} ${status} ${file}` });
 }
 
 function logFileChange(event, filename) {
@@ -70,6 +71,7 @@ function logFileChange(event, filename) {
     chalk.gray('@'),
     chalk.yellow(new Date().toLocaleTimeString())
   );
+  logToFile({ level: 'INFO', event: 'FILE_CHANGE', detail: `${filename} ${event}` });
 }
 
 // Watch view directory for changes
@@ -88,6 +90,8 @@ function logDDoS({ method, url, status, ip, file, time, count }) {
     chalk.gray('|'),
     chalk.white('File:'), chalk.blue(file)
   );
+  logToFile({ level: 'WARN', ip, event: 'DDOS', detail: `${method} ${url} ${count} reqs` });
+  if (count > 50) sendWebhook('DDOS_ALERT', `IP ${ip} sent ${count} reqs to ${url}`);
 }
 
 const BLACKLIST_FILE = path.join(__dirname, 'blacklisted.json');
@@ -122,9 +126,13 @@ function logBlock(ip, url, count, perm) {
   } else {
     console.log(bgFg(' BLOCKED ', 'red', 'white'), chalk.yellow(`IP ${ip} diblokir (${count}/${MAX_BLOCKS}) karena spam akses ke ${url}`), chalk.gray('@'), chalk.yellow(new Date().toLocaleTimeString()));
   }
+  logToFile({ level: perm ? 'ERROR' : 'WARN', ip, event: perm ? 'PERM_BLOCK' : 'BLOCKED', detail: `${url} (${count})` });
+  incrementStat(perm ? 'permBlocked' : 'blocked', ip);
+  if (perm) sendWebhook('PERM_BLOCK', `IP ${ip} permanently blocked on ${url}`);
 }
 function logUnblock(ip) {
   console.log(bgFg(' UNBLOCK ', 'green', 'black'), chalk.yellow(`IP ${ip} diizinkan kembali`), chalk.gray('@'), chalk.yellow(new Date().toLocaleTimeString()));
+  logToFile({ level: 'INFO', ip, event: 'UNBLOCK', detail: 'Unblocked after timeout' });
 }
 
 const BLOCKED_HTML = path.join(viewDir, 'blocked.html');
@@ -149,11 +157,13 @@ const CHECK_HOST_MAX = 5;
 function logCheckHostTimeout(ip, url, headers) {
   console.log(bgFg(' CHECK-HOST-TIMEOUT ', 'red', 'white'), chalk.cyan(ip), chalk.magenta(url), chalk.white('Check-host.net timeout simulated!'), chalk.gray('@'), chalk.yellow(new Date().toLocaleTimeString()));
   console.log(chalk.gray('Headers:'), JSON.stringify(headers));
+  logToFile({ level: 'WARN', ip, event: 'CHECK_HOST_TIMEOUT', detail: `${url} headers: ${JSON.stringify(headers)}` });
 }
 
 function logCheckHost(ip, url, headers) {
   console.log(bgFg(' CHECK-HOST ', 'yellow', 'black'), chalk.cyan(ip), chalk.magenta(url), chalk.white('Detected check-host.net or similar!'), chalk.gray('@'), chalk.yellow(new Date().toLocaleTimeString()));
   console.log(chalk.gray('Headers:'), JSON.stringify(headers));
+  logToFile({ level: 'INFO', ip, event: 'CHECK_HOST', detail: `${url} headers: ${JSON.stringify(headers)}` });
 }
 
 function isSuspiciousUA(ua) {
@@ -164,6 +174,34 @@ function logAllRequests(req, ip) {
   const ua = req.headers['user-agent'] || '-';
   console.log(bgFg(' HTTP REQ ', 'blue', 'white'), chalk.cyan(req.method), chalk.magenta(req.url), chalk.yellow(ip), chalk.gray('UA:'), chalk.white(ua));
 }
+
+// ===== WHITELIST IP FEATURE START =====
+const { whitelistMiddleware, whitelisted } = require('./antiddos/whitelist');
+// ===== WHITELIST IP FEATURE END =====
+
+const { userAgentListMiddleware } = require('./antiddos/userAgentList');
+const { logToFile, requestLogger } = require('./antiddos/logger');
+const { statsMiddleware, incrementStat } = require('./antiddos/stats');
+const { captchaMiddleware } = require('./antiddos/captcha');
+const { notifyAdmin } = require('./antiddos/notifier');
+const { endpointLimiter } = require('./antiddos/endpointLimiter');
+const { geoipBlockMiddleware } = require('./antiddos/geoipBlock');
+const { maintenanceMiddleware } = require('./antiddos/maintenance');
+const { blocklistApiMiddleware } = require('./antiddos/blocklistApi');
+const { syncBlocklistFromUrl } = require('./antiddos/blocklistSync');
+const { tokenLimiter } = require('./antiddos/tokenLimiter');
+const { sendWebhook } = require('./antiddos/webhook');
+const { blocklistExportImportMiddleware } = require('./antiddos/blocklistExport');
+const { pathBlockerMiddleware } = require('./antiddos/pathBlocker');
+const { monitorMiddleware } = require('./antiddos/monitor');
+
+// Contoh: auto-sync blocklist dari FireHOL setiap 12 jam
+// syncBlocklistFromUrl('https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset');
+// setInterval(() => {
+//   syncBlocklistFromUrl('https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset', (err, count) => {
+//     if (!err) console.log(`[Blocklist Sync] Updated ${count} IPs from FireHOL`);
+//   });
+// }, 12 * 60 * 60 * 1000);
 
 const server = http.createServer(async (req, res) => {
   // Get real IP if behind Cloudflare or proxy
@@ -188,7 +226,81 @@ const server = http.createServer(async (req, res) => {
       return;
     }
   }
-  await loadBlacklist();
+  // Middleware monitoring real-time
+  await monitorMiddleware(req, res, () => {});
+  // Middleware maintenance mode
+  await maintenanceMiddleware(req, res, () => {});
+  // Middleware blacklist/whitelist user-agent
+  userAgentListMiddleware(req, res, () => {});
+  // Middleware statistik: hitung request & aktifkan endpoint /admin/stats
+  await statsMiddleware(req, res, () => {});
+  incrementStat('request', ip);
+  // Middleware captcha: jika IP terblokir, arahkan ke captcha
+  await captchaMiddleware(req, res, () => {});
+  // Middleware GeoIP blocking
+  await new Promise(resolve => geoipBlockMiddleware(req, res, resolve));
+  await whitelistMiddleware(req, res, () => {});
+  // Middleware rate limit per token/cookie
+  tokenLimiter(req, res, () => {});
+  // Middleware rate limit per endpoint
+  endpointLimiter(req, res, () => {});
+  // Middleware API blocklist/whitelist
+  await blocklistApiMiddleware(req, res, () => {});
+  // Middleware export/import blocklist
+  await blocklistExportImportMiddleware(req, res, () => {});
+  // Middleware block sementara per-path
+  pathBlockerMiddleware(req, res, () => {});
+  if (req.isWhitelisted) {
+    // IP di whitelist, lewati semua blokir dan rate limit
+    let filePath = path.join(viewDir, req.url === '/' ? 'index.html' : req.url);
+    const extname = String(path.extname(filePath)).toLowerCase();
+    const mimeTypes = {
+      '.html': 'text/html',
+      '.js': 'text/javascript',
+      '.css': 'text/css',
+      '.json': 'application/json',
+      '.png': 'image/png',
+      '.jpg': 'image/jpg',
+      '.gif': 'image/gif',
+      '.svg': 'image/svg+xml',
+      '.ico': 'image/x-icon',
+      '.woff': 'font/woff',
+      '.woff2': 'font/woff2',
+      '.ttf': 'font/ttf',
+      '.eot': 'application/vnd.ms-fontobject',
+    };
+    fs.readFile(filePath, (error, content) => {
+      let status = 200;
+      if (error) {
+        if (error.code === 'ENOENT') {
+          status = 404;
+          logAccess({ method: req.method, url: req.url, status, ip, file: path.basename(filePath), time: new Date().toLocaleTimeString() });
+          res.writeHead(404, { 'Content-Type': 'text/html' });
+          res.end('<h1>404 Not Found</h1>', 'utf-8');
+        } else {
+          status = 500;
+          logAccess({ method: req.method, url: req.url, status, ip, file: path.basename(filePath), time: new Date().toLocaleTimeString() });
+          res.writeHead(500);
+          res.end('Sorry, check with the site admin for error: ' + error.code + ' ..\n');
+        }
+      } else {
+        if (req.url !== '/' && path.basename(filePath) !== 'index.html') {
+          console.log(bgFg(' FILE ACCESS ', 'yellow', 'black'), chalk.cyan(ip), chalk.magenta(req.url), chalk.white('->'), chalk.blue(path.basename(filePath)), chalk.gray('@'), chalk.yellow(new Date().toLocaleTimeString()));
+        }
+        res.writeHead(200, { 'Content-Type': mimeTypes[extname] || 'application/octet-stream' });
+        res.end(content, 'utf-8');
+      }
+      logAccess({
+        method: req.method,
+        url: req.url,
+        status,
+        ip,
+        file: path.basename(filePath),
+        time: new Date().toLocaleTimeString()
+      });
+    });
+    return;
+  }
   if (blacklisted.has(ip)) {
     logBlock(ip, req.url, MAX_BLOCKS, true);
     await servePermBlockedPage(res);
