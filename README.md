@@ -93,6 +93,3 @@ httpjs/
 - Untuk kontribusi, silakan pull request atau kontak admin.
 
 ---
-
-## Author
-Protected By **R.A.S Cyber Team** 
